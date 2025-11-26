@@ -39,6 +39,14 @@ defmodule SemanteqTest do
       {:ok, result} = Generator.run_tests(gexpr, %{})
       assert result.skipped == true
     end
+
+    test "default_retry_config returns expected defaults" do
+      config = Generator.default_retry_config()
+      assert config.max_retries == 3
+      assert config.retry_on == [:generate, :evaluate, :test]
+      assert config.backoff_ms == 100
+      assert config.exponential_backoff == true
+    end
   end
 
   describe "Semanteq public API" do
@@ -138,6 +146,33 @@ defmodule SemanteqTest do
       conn = Router.call(conn, Router.init([]))
 
       assert conn.status == 400
+    end
+
+    test "POST /generate-with-retry without prompt returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/generate-with-retry", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "prompt"
+    end
+
+    test "GET /retry-config returns default configuration" do
+      conn = Plug.Test.conn(:get, "/retry-config")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["max_retries"] == 3
+      assert body["data"]["retry_on"] == ["generate", "evaluate", "test"]
+      assert body["data"]["backoff_ms"] == 100
+      assert body["data"]["exponential_backoff"] == true
     end
 
     test "unknown route returns 404" do
