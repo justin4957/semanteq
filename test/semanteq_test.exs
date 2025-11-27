@@ -47,6 +47,13 @@ defmodule SemanteqTest do
       assert config.backoff_ms == 100
       assert config.exponential_backoff == true
     end
+
+    test "default_batch_config returns expected defaults" do
+      config = Generator.default_batch_config()
+      assert config.parallelism == 5
+      assert config.stop_on_error == false
+      assert config.with_retry == false
+    end
   end
 
   describe "Semanteq public API" do
@@ -173,6 +180,60 @@ defmodule SemanteqTest do
       assert body["data"]["retry_on"] == ["generate", "evaluate", "test"]
       assert body["data"]["backoff_ms"] == 100
       assert body["data"]["exponential_backoff"] == true
+    end
+
+    test "POST /batch without prompts returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/batch", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "prompts"
+    end
+
+    test "POST /batch with non-array prompts returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/batch", Jason.encode!(%{"prompts" => "not an array"}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "must be an array"
+    end
+
+    test "POST /batch with invalid prompt item returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/batch", Jason.encode!(%{"prompts" => [%{"no_prompt" => "here"}]}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "prompt"
+    end
+
+    test "GET /batch-config returns default configuration" do
+      conn = Plug.Test.conn(:get, "/batch-config")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["parallelism"] == 5
+      assert body["data"]["stop_on_error"] == false
+      assert body["data"]["with_retry"] == false
     end
 
     test "unknown route returns 404" do

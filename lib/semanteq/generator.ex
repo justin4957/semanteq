@@ -31,6 +31,7 @@ defmodule Semanteq.Generator do
   @default_max_retries 3
   @default_retry_on [:generate, :evaluate, :test]
   @default_backoff_ms 100
+  @default_batch_parallelism 5
 
   @doc """
   Generates and tests a G-expression from a natural language prompt.
@@ -303,7 +304,304 @@ defmodule Semanteq.Generator do
     }
   end
 
+  @doc """
+  Returns the default batch configuration.
+  """
+  def default_batch_config do
+    %{
+      parallelism: @default_batch_parallelism,
+      stop_on_error: false,
+      with_retry: false
+    }
+  end
+
+  @doc """
+  Processes multiple prompts in a batch with parallel execution.
+
+  ## Parameters
+    - prompts: List of prompts to process, each can be:
+      - A string (prompt text)
+      - A map with `:prompt` and optional per-item options
+    - opts: Options map with:
+      - `:parallelism` - Number of concurrent tasks (default: 5)
+      - `:stop_on_error` - Stop batch on first error (default: false)
+      - `:with_retry` - Use retry mechanism for each item (default: false)
+      - Plus all options from `generate_and_test/2` or `generate_with_retry/2`
+
+  ## Returns
+    - `{:ok, batch_result}` with results and summary statistics
+
+  ## Examples
+
+      iex> prompts = [
+      ...>   "Create a function that doubles a number",
+      ...>   "Create a function that adds two numbers",
+      ...>   %{prompt: "Create factorial function", test_inputs: [[5]]}
+      ...> ]
+      iex> Semanteq.Generator.batch_generate(prompts, %{parallelism: 3})
+      {:ok, %{
+        total: 3,
+        succeeded: 2,
+        failed: 1,
+        total_time_ms: 5230,
+        results: [
+          %{index: 0, status: :ok, result: %{...}},
+          %{index: 1, status: :ok, result: %{...}},
+          %{index: 2, status: :error, error: %{...}}
+        ],
+        summary: %{
+          success_rate: 0.67,
+          avg_time_ms: 1743
+        }
+      }}
+  """
+  def batch_generate(prompts, opts \\ %{}) when is_list(prompts) do
+    parallelism = Map.get(opts, :parallelism, @default_batch_parallelism)
+    stop_on_error = Map.get(opts, :stop_on_error, false)
+    with_retry = Map.get(opts, :with_retry, false)
+
+    start_time = System.monotonic_time(:millisecond)
+
+    Logger.info(
+      "Starting batch generation of #{length(prompts)} prompts with parallelism #{parallelism}"
+    )
+
+    # Normalize prompts to a consistent format
+    normalized_prompts =
+      prompts
+      |> Enum.with_index()
+      |> Enum.map(fn {prompt, index} ->
+        {index, normalize_prompt_item(prompt, opts)}
+      end)
+
+    # Process in parallel with controlled concurrency
+    results =
+      if stop_on_error do
+        process_batch_sequential_on_error(normalized_prompts, with_retry, parallelism)
+      else
+        process_batch_parallel(normalized_prompts, with_retry, parallelism)
+      end
+
+    end_time = System.monotonic_time(:millisecond)
+    total_time_ms = end_time - start_time
+
+    # Build summary
+    batch_result = build_batch_result(results, total_time_ms)
+
+    Logger.info(
+      "Batch generation completed: #{batch_result.succeeded}/#{batch_result.total} succeeded in #{total_time_ms}ms"
+    )
+
+    {:ok, batch_result}
+  end
+
+  @doc """
+  Processes a batch from JSON input (for API compatibility).
+
+  Accepts a list of items where each item has at minimum a "prompt" field.
+
+  ## Parameters
+    - items: List of maps with "prompt" key and optional configuration
+    - opts: Batch options
+
+  ## Returns
+    - Same as `batch_generate/2`
+  """
+  def batch_generate_from_json(items, opts \\ %{}) when is_list(items) do
+    prompts =
+      Enum.map(items, fn item ->
+        prompt = Map.get(item, "prompt") || Map.get(item, :prompt)
+
+        if prompt do
+          item_opts =
+            item
+            |> Map.delete("prompt")
+            |> Map.delete(:prompt)
+            |> atomize_keys()
+
+          if map_size(item_opts) > 0 do
+            Map.put(item_opts, :prompt, prompt)
+          else
+            prompt
+          end
+        else
+          raise ArgumentError, "Each batch item must have a 'prompt' field"
+        end
+      end)
+
+    batch_generate(prompts, opts)
+  end
+
   # Private functions
+
+  defp normalize_prompt_item(prompt, base_opts) when is_binary(prompt) do
+    %{prompt: prompt, opts: base_opts}
+  end
+
+  defp normalize_prompt_item(%{prompt: prompt} = item, base_opts) when is_binary(prompt) do
+    item_opts = Map.delete(item, :prompt)
+    merged_opts = Map.merge(base_opts, item_opts)
+    %{prompt: prompt, opts: merged_opts}
+  end
+
+  defp normalize_prompt_item(item, base_opts) when is_map(item) do
+    # Handle string keys
+    prompt = Map.get(item, "prompt") || Map.get(item, :prompt)
+
+    if prompt do
+      item_opts =
+        item
+        |> Map.delete("prompt")
+        |> Map.delete(:prompt)
+        |> atomize_keys()
+
+      merged_opts = Map.merge(base_opts, item_opts)
+      %{prompt: prompt, opts: merged_opts}
+    else
+      raise ArgumentError, "Batch item must have a 'prompt' field"
+    end
+  end
+
+  defp atomize_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {k, v} when is_binary(k) -> {String.to_existing_atom(k), v}
+      {k, v} -> {k, v}
+    end)
+  rescue
+    ArgumentError -> map
+  end
+
+  defp process_batch_parallel(normalized_prompts, with_retry, parallelism) do
+    normalized_prompts
+    |> Task.async_stream(
+      fn {index, %{prompt: prompt, opts: item_opts}} ->
+        start_time = System.monotonic_time(:millisecond)
+
+        result =
+          if with_retry do
+            generate_with_retry(prompt, item_opts)
+          else
+            generate_and_test(prompt, item_opts)
+          end
+
+        end_time = System.monotonic_time(:millisecond)
+        duration_ms = end_time - start_time
+
+        case result do
+          {:ok, generation_result} ->
+            %{
+              index: index,
+              status: :ok,
+              result: generation_result,
+              duration_ms: duration_ms
+            }
+
+          {:error, reason} ->
+            %{
+              index: index,
+              status: :error,
+              error: reason,
+              duration_ms: duration_ms
+            }
+        end
+      end,
+      max_concurrency: parallelism,
+      timeout: :infinity,
+      ordered: true
+    )
+    |> Enum.map(fn {:ok, result} -> result end)
+  end
+
+  defp process_batch_sequential_on_error(normalized_prompts, with_retry, parallelism) do
+    # Process in chunks, stopping if any chunk has an error
+    normalized_prompts
+    |> Enum.chunk_every(parallelism)
+    |> Enum.reduce_while([], fn chunk, acc ->
+      chunk_results =
+        chunk
+        |> Task.async_stream(
+          fn {index, %{prompt: prompt, opts: item_opts}} ->
+            start_time = System.monotonic_time(:millisecond)
+
+            result =
+              if with_retry do
+                generate_with_retry(prompt, item_opts)
+              else
+                generate_and_test(prompt, item_opts)
+              end
+
+            end_time = System.monotonic_time(:millisecond)
+            duration_ms = end_time - start_time
+
+            case result do
+              {:ok, generation_result} ->
+                %{
+                  index: index,
+                  status: :ok,
+                  result: generation_result,
+                  duration_ms: duration_ms
+                }
+
+              {:error, reason} ->
+                %{
+                  index: index,
+                  status: :error,
+                  error: reason,
+                  duration_ms: duration_ms
+                }
+            end
+          end,
+          max_concurrency: parallelism,
+          timeout: :infinity
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      has_error = Enum.any?(chunk_results, &(&1.status == :error))
+
+      if has_error do
+        {:halt, acc ++ chunk_results}
+      else
+        {:cont, acc ++ chunk_results}
+      end
+    end)
+  end
+
+  defp build_batch_result(results, total_time_ms) do
+    total = length(results)
+    succeeded = Enum.count(results, &(&1.status == :ok))
+    failed = total - succeeded
+
+    durations =
+      results
+      |> Enum.filter(&(&1.status == :ok))
+      |> Enum.map(& &1.duration_ms)
+
+    avg_time_ms =
+      if length(durations) > 0 do
+        Enum.sum(durations) / length(durations)
+      else
+        0
+      end
+
+    success_rate =
+      if total > 0 do
+        Float.round(succeeded / total, 2)
+      else
+        0.0
+      end
+
+    %{
+      total: total,
+      succeeded: succeeded,
+      failed: failed,
+      total_time_ms: total_time_ms,
+      results: Enum.sort_by(results, & &1.index),
+      summary: %{
+        success_rate: success_rate,
+        avg_time_ms: Float.round(avg_time_ms, 2)
+      }
+    }
+  end
 
   defp do_generate_with_retry(_prompt, _opts, 0, _retry_on, _backoff_ms, _exp, state) do
     {:error, :max_retries_exceeded, state}
