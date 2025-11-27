@@ -70,6 +70,25 @@ defmodule Semanteq.Router do
   ### GET /retry-config
   Get default retry configuration.
 
+  ### POST /batch
+  Process multiple prompts in batch with parallel execution.
+
+  Request body:
+  ```json
+  {
+    "prompts": [
+      "Create a function that doubles a number",
+      {"prompt": "Create a factorial function", "test_inputs": [[5]]}
+    ],
+    "parallelism": 5,
+    "stop_on_error": false,
+    "with_retry": false
+  }
+  ```
+
+  ### GET /batch-config
+  Get default batch configuration.
+
   ### GET /health
   Health check endpoint.
   """
@@ -246,6 +265,50 @@ defmodule Semanteq.Router do
     })
   end
 
+  # POST /batch - Process multiple prompts in batch
+  post "/batch" do
+    case conn.body_params do
+      %{"prompts" => prompts} when is_list(prompts) ->
+        opts = parse_batch_options(conn.body_params)
+
+        try do
+          case Generator.batch_generate_from_json(prompts, opts) do
+            {:ok, result} ->
+              send_json(conn, 200, %{success: true, data: result})
+
+            {:error, reason} ->
+              send_json(conn, 422, %{success: false, error: format_error(reason)})
+          end
+        rescue
+          ArgumentError ->
+            send_json(conn, 400, %{
+              success: false,
+              error: "Invalid batch item: each item must have a 'prompt' field"
+            })
+        end
+
+      %{"prompts" => _} ->
+        send_json(conn, 400, %{success: false, error: "Field 'prompts' must be an array"})
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: prompts"})
+    end
+  end
+
+  # GET /batch-config - Get default batch configuration
+  get "/batch-config" do
+    config = Generator.default_batch_config()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: %{
+        parallelism: config.parallelism,
+        stop_on_error: config.stop_on_error,
+        with_retry: config.with_retry
+      }
+    })
+  end
+
   # GET /health - Health check endpoint
   get "/health" do
     glisp_status = check_glisp_health()
@@ -334,6 +397,39 @@ defmodule Semanteq.Router do
 
     if Map.has_key?(params, "exponential_backoff") do
       Map.put(opts, :exponential_backoff, params["exponential_backoff"])
+    else
+      opts
+    end
+  end
+
+  defp parse_batch_options(params) do
+    opts = %{}
+
+    opts =
+      if Map.has_key?(params, "parallelism") do
+        Map.put(opts, :parallelism, params["parallelism"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "stop_on_error") do
+        Map.put(opts, :stop_on_error, params["stop_on_error"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "with_retry") do
+        Map.put(opts, :with_retry, params["with_retry"])
+      else
+        opts
+      end
+
+    # Include retry options if with_retry is enabled
+    if Map.get(params, "with_retry", false) do
+      parse_retry_options(params)
+      |> Map.merge(opts)
     else
       opts
     end
