@@ -689,14 +689,8 @@ defmodule Semanteq.Router do
     case conn.body_params do
       %{"prompt" => prompt} = params ->
         opts = parse_compare_options(params)
-
-        case ProviderComparison.compare(prompt, opts) do
-          {:ok, result} ->
-            send_json(conn, 200, %{success: true, data: result})
-
-          {:error, reason} ->
-            send_json(conn, 422, %{success: false, error: format_error(reason)})
-        end
+        {:ok, result} = ProviderComparison.compare(prompt, opts)
+        send_json(conn, 200, %{success: true, data: result})
 
       _ ->
         send_json(conn, 400, %{success: false, error: "Missing required field: prompt"})
