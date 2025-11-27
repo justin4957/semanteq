@@ -192,13 +192,53 @@ defmodule Semanteq.Router do
   {"provider": "mock"}
   ```
 
+  ### POST /compare
+  Compare generation across multiple providers.
+
+  Request body:
+  ```json
+  {
+    "prompt": "Create a function that doubles a number",
+    "providers": ["anthropic", "openai"],
+    "timeout_ms": 60000,
+    "parallel": true,
+    "test_inputs": [[1], [2], [5]],
+    "include_evaluation": true
+  }
+  ```
+
+  ### GET /compare-config
+  Get default comparison configuration.
+
+  ### GET /compare/providers
+  Get available providers for comparison.
+
+  ### POST /compare/diff
+  Compare two G-expressions and generate diff.
+
+  Request body:
+  ```json
+  {
+    "gexpr_a": {"g": "lit", "v": 42},
+    "gexpr_b": {"g": "lit", "v": 43}
+  }
+  ```
+
   ### GET /health
   Health check endpoint.
   """
 
   use Plug.Router
 
-  alias Semanteq.{Generator, Glisp, Anthropic, PropertyTester, Tracer, Provider}
+  alias Semanteq.{
+    Generator,
+    Glisp,
+    Anthropic,
+    PropertyTester,
+    Tracer,
+    Provider,
+    ProviderComparison
+  }
 
   plug(Plug.Logger)
 
@@ -644,6 +684,64 @@ defmodule Semanteq.Router do
     end
   end
 
+  # POST /compare - Compare generation across multiple providers
+  post "/compare" do
+    case conn.body_params do
+      %{"prompt" => prompt} = params ->
+        opts = parse_compare_options(params)
+        {:ok, result} = ProviderComparison.compare(prompt, opts)
+        send_json(conn, 200, %{success: true, data: result})
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: prompt"})
+    end
+  end
+
+  # GET /compare-config - Get default comparison configuration
+  get "/compare-config" do
+    config = ProviderComparison.default_config()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: config
+    })
+  end
+
+  # GET /compare/providers - Get available providers for comparison
+  get "/compare/providers" do
+    providers = ProviderComparison.available_providers()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: %{
+        available: Enum.map(providers, &Atom.to_string/1),
+        count: length(providers)
+      }
+    })
+  end
+
+  # POST /compare/diff - Compare two G-expressions
+  post "/compare/diff" do
+    case conn.body_params do
+      %{"gexpr_a" => gexpr_a, "gexpr_b" => gexpr_b} ->
+        diff = ProviderComparison.diff_gexprs(gexpr_a, gexpr_b)
+
+        send_json(conn, 200, %{
+          success: true,
+          data: %{
+            diff: diff,
+            has_differences: length(diff) > 0
+          }
+        })
+
+      _ ->
+        send_json(conn, 400, %{
+          success: false,
+          error: "Missing required fields: gexpr_a, gexpr_b"
+        })
+    end
+  end
+
   # GET /health - Health check endpoint
   get "/health" do
     glisp_status = check_glisp_health()
@@ -905,6 +1003,50 @@ defmodule Semanteq.Router do
       %{include_hotspots: params["include_hotspots"]}
     else
       %{}
+    end
+  end
+
+  defp parse_compare_options(params) do
+    opts = []
+
+    opts =
+      if Map.has_key?(params, "providers") do
+        providers =
+          params["providers"]
+          |> Enum.map(fn p ->
+            if is_binary(p), do: String.to_existing_atom(p), else: p
+          end)
+
+        Keyword.put(opts, :providers, providers)
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "timeout_ms") do
+        Keyword.put(opts, :timeout_ms, params["timeout_ms"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "parallel") do
+        Keyword.put(opts, :parallel, params["parallel"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "test_inputs") do
+        Keyword.put(opts, :test_inputs, params["test_inputs"])
+      else
+        opts
+      end
+
+    if Map.has_key?(params, "include_evaluation") do
+      Keyword.put(opts, :include_evaluation, params["include_evaluation"])
+    else
+      opts
     end
   end
 

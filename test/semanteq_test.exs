@@ -1,7 +1,17 @@
 defmodule SemanteqTest do
   use ExUnit.Case
 
-  alias Semanteq.{Glisp, Anthropic, Generator, Router, PropertyTester, Tracer, Provider}
+  alias Semanteq.{
+    Glisp,
+    Anthropic,
+    Generator,
+    Router,
+    PropertyTester,
+    Tracer,
+    Provider,
+    ProviderComparison
+  }
+
   alias Semanteq.Providers.{Mock, OpenAI, Ollama}
 
   describe "Semanteq.Glisp" do
@@ -943,6 +953,237 @@ defmodule SemanteqTest do
       providers = Provider.list_providers()
       assert Map.has_key?(providers, :ollama)
       assert providers[:ollama].module == Semanteq.Providers.Ollama
+    end
+  end
+
+  describe "Semanteq.ProviderComparison" do
+    test "default_config returns expected defaults" do
+      config = ProviderComparison.default_config()
+      assert config.timeout_ms == 60_000
+      assert config.parallel == true
+      assert config.include_evaluation == true
+      assert is_list(config.test_inputs)
+    end
+
+    test "available_providers returns list of provider atoms" do
+      providers = ProviderComparison.available_providers()
+      assert is_list(providers)
+      # Mock provider should always be available
+      assert :mock in providers
+    end
+
+    test "provider_available? returns true for mock provider" do
+      assert ProviderComparison.provider_available?(:mock) == true
+    end
+
+    test "provider_available? returns false for unknown provider" do
+      assert ProviderComparison.provider_available?(:nonexistent) == false
+    end
+
+    test "diff_gexprs returns empty list for identical expressions" do
+      gexpr = %{"g" => "lit", "v" => 42}
+      diff = ProviderComparison.diff_gexprs(gexpr, gexpr)
+      assert diff == []
+    end
+
+    test "diff_gexprs returns differences for different values" do
+      gexpr_a = %{"g" => "lit", "v" => 42}
+      gexpr_b = %{"g" => "lit", "v" => 43}
+      diff = ProviderComparison.diff_gexprs(gexpr_a, gexpr_b)
+      assert length(diff) > 0
+      assert Enum.any?(diff, fn d -> d.type == :changed end)
+    end
+
+    test "diff_gexprs returns differences for different genres" do
+      gexpr_a = %{"g" => "lit", "v" => 42}
+      gexpr_b = %{"g" => "ref", "v" => "x"}
+      diff = ProviderComparison.diff_gexprs(gexpr_a, gexpr_b)
+      assert length(diff) > 0
+    end
+
+    test "diff_gexprs detects added keys" do
+      gexpr_a = %{"g" => "lit", "v" => 42}
+      gexpr_b = %{"g" => "lit", "v" => 42, "m" => %{"type" => "number"}}
+      diff = ProviderComparison.diff_gexprs(gexpr_a, gexpr_b)
+      assert Enum.any?(diff, fn d -> d.type == :added end)
+    end
+
+    test "diff_gexprs detects removed keys" do
+      gexpr_a = %{"g" => "lit", "v" => 42, "m" => %{"type" => "number"}}
+      gexpr_b = %{"g" => "lit", "v" => 42}
+      diff = ProviderComparison.diff_gexprs(gexpr_a, gexpr_b)
+      assert Enum.any?(diff, fn d -> d.type == :removed end)
+    end
+
+    test "compare_performance returns latency comparison" do
+      result_a = %{provider: :anthropic, latency_ms: 100}
+      result_b = %{provider: :openai, latency_ms: 150}
+
+      comparison = ProviderComparison.compare_performance(result_a, result_b)
+      assert comparison.latency_difference_ms == -50
+      assert comparison.faster_provider == :anthropic
+      assert comparison.latency_ratio == 0.67
+    end
+
+    test "compare with mock provider returns comparison results" do
+      {:ok, comparison} =
+        ProviderComparison.compare(
+          "Create a function that doubles a number",
+          providers: [:mock],
+          include_evaluation: false
+        )
+
+      assert comparison.prompt == "Create a function that doubles a number"
+      assert comparison.providers_compared == [:mock]
+      assert is_list(comparison.results)
+      assert is_map(comparison.performance)
+      assert is_map(comparison.equivalence)
+      assert is_list(comparison.recommendations)
+      assert is_binary(comparison.summary)
+      assert is_integer(comparison.total_time_ms)
+    end
+
+    test "compare returns performance metrics" do
+      {:ok, comparison} =
+        ProviderComparison.compare(
+          "test",
+          providers: [:mock],
+          include_evaluation: false
+        )
+
+      assert comparison.performance.total_providers == 1
+      assert comparison.performance.successful_count >= 0
+
+      assert is_map(comparison.performance.latency_stats) or
+               is_nil(comparison.performance.latency_stats)
+    end
+
+    test "compare handles multiple providers" do
+      {:ok, comparison} =
+        ProviderComparison.compare(
+          "test",
+          providers: [:mock, :mock],
+          include_evaluation: false
+        )
+
+      assert length(comparison.results) == 2
+    end
+  end
+
+  describe "Router compare endpoints" do
+    test "POST /compare without prompt returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/compare", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "prompt"
+    end
+
+    test "POST /compare with prompt returns 200" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/compare",
+          Jason.encode!(%{
+            "prompt" => "test",
+            "providers" => ["mock"],
+            "include_evaluation" => false
+          })
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert is_map(body["data"])
+    end
+
+    test "GET /compare-config returns configuration" do
+      conn = Plug.Test.conn(:get, "/compare-config")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["timeout_ms"] == 60_000
+      assert body["data"]["parallel"] == true
+    end
+
+    test "GET /compare/providers returns available providers" do
+      conn = Plug.Test.conn(:get, "/compare/providers")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert is_list(body["data"]["available"])
+      assert is_integer(body["data"]["count"])
+    end
+
+    test "POST /compare/diff without gexprs returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/compare/diff", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "gexpr_a"
+    end
+
+    test "POST /compare/diff with identical gexprs returns empty diff" do
+      gexpr = %{"g" => "lit", "v" => 42}
+
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/compare/diff",
+          Jason.encode!(%{
+            "gexpr_a" => gexpr,
+            "gexpr_b" => gexpr
+          })
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["has_differences"] == false
+      assert body["data"]["diff"] == []
+    end
+
+    test "POST /compare/diff with different gexprs returns differences" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/compare/diff",
+          Jason.encode!(%{
+            "gexpr_a" => %{"g" => "lit", "v" => 42},
+            "gexpr_b" => %{"g" => "lit", "v" => 43}
+          })
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["has_differences"] == true
+      assert length(body["data"]["diff"]) > 0
     end
   end
 end
