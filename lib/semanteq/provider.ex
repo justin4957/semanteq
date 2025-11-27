@@ -127,6 +127,7 @@ defmodule Semanteq.Provider do
   def registered_providers do
     %{
       anthropic: Semanteq.Providers.Anthropic,
+      openai: Semanteq.Providers.OpenAI,
       mock: Semanteq.Providers.Mock
     }
   end

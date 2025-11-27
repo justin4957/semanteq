@@ -8,6 +8,17 @@ config :semanteq, :anthropic,
   max_tokens: 4096,
   temperature: 0.7
 
+# OpenAI API configuration
+config :semanteq, :openai,
+  api_key: System.get_env("OPENAI_API_KEY"),
+  model: "gpt-4o-mini",
+  base_url: "https://api.openai.com/v1",
+  max_tokens: 4096,
+  temperature: 0.7
+
+# Provider configuration (default active provider)
+config :semanteq, :provider, active: :anthropic
+
 # G-Lisp CLI configuration
 config :semanteq, :glisp,
   project_dir: "/Users/coolbeans/Development/dev/glisp-stuff/glisp",
