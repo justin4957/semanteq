@@ -124,13 +124,56 @@ defmodule Semanteq.Router do
   ### GET /properties
   Get list of available property types.
 
+  ### POST /trace
+  Evaluate a G-expression with detailed trace capture.
+
+  Request body:
+  ```json
+  {
+    "gexpr": {...},
+    "level": "standard",
+    "include_source": true,
+    "include_timestamps": true
+  }
+  ```
+
+  ### POST /trace/compare
+  Compare two execution traces.
+
+  Request body:
+  ```json
+  {
+    "trace_a": {...},
+    "trace_b": {...},
+    "ignore_timing": true,
+    "compare_steps": true
+  }
+  ```
+
+  ### POST /trace/analyze
+  Analyze a trace for insights and statistics.
+
+  Request body:
+  ```json
+  {
+    "trace": {...},
+    "include_hotspots": true
+  }
+  ```
+
+  ### GET /trace-config
+  Get default trace configuration.
+
+  ### GET /trace-levels
+  Get available trace levels and descriptions.
+
   ### GET /health
   Health check endpoint.
   """
 
   use Plug.Router
 
-  alias Semanteq.{Generator, Glisp, Anthropic, PropertyTester}
+  alias Semanteq.{Generator, Glisp, Anthropic, PropertyTester, Tracer}
 
   plug(Plug.Logger)
 
@@ -307,13 +350,8 @@ defmodule Semanteq.Router do
         opts = parse_batch_options(conn.body_params)
 
         try do
-          case Generator.batch_generate_from_json(prompts, opts) do
-            {:ok, result} ->
-              send_json(conn, 200, %{success: true, data: result})
-
-            {:error, reason} ->
-              send_json(conn, 422, %{success: false, error: format_error(reason)})
-          end
+          {:ok, result} = Generator.batch_generate_from_json(prompts, opts)
+          send_json(conn, 200, %{success: true, data: result})
         rescue
           ArgumentError ->
             send_json(conn, 400, %{
@@ -374,13 +412,8 @@ defmodule Semanteq.Router do
         opts = parse_property_options(params)
         parsed_properties = Enum.map(properties, &parse_property/1)
 
-        case PropertyTester.test_properties(gexpr, parsed_properties, opts) do
-          {:ok, result} ->
-            send_json(conn, 200, %{success: true, data: result})
-
-          {:error, reason} ->
-            send_json(conn, 422, %{success: false, error: format_error(reason)})
-        end
+        {:ok, result} = PropertyTester.test_properties(gexpr, parsed_properties, opts)
+        send_json(conn, 200, %{success: true, data: result})
 
       %{"gexpr" => _gexpr, "properties" => _} ->
         send_json(conn, 400, %{success: false, error: "Field 'properties' must be an array"})
@@ -423,6 +456,93 @@ defmodule Semanteq.Router do
     send_json(conn, 200, %{
       success: true,
       data: formatted_properties
+    })
+  end
+
+  # POST /trace - Evaluate with detailed trace capture
+  post "/trace" do
+    case conn.body_params do
+      %{"gexpr" => gexpr} = params ->
+        opts = parse_trace_options(params)
+
+        case Tracer.eval_with_trace(gexpr, opts) do
+          {:ok, result} ->
+            send_json(conn, 200, %{success: true, data: result})
+
+          {:error, %{reason: reason, trace: trace}} ->
+            send_json(conn, 422, %{
+              success: false,
+              error: format_error(reason),
+              trace: trace
+            })
+
+          {:error, reason} ->
+            send_json(conn, 422, %{success: false, error: format_error(reason)})
+        end
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: gexpr"})
+    end
+  end
+
+  # POST /trace/compare - Compare two execution traces
+  post "/trace/compare" do
+    case conn.body_params do
+      %{"trace_a" => trace_a, "trace_b" => trace_b} = params ->
+        opts = parse_trace_compare_options(params)
+        # Convert string keys to atoms for traces
+        trace_a_normalized = normalize_trace_keys(trace_a)
+        trace_b_normalized = normalize_trace_keys(trace_b)
+
+        {:ok, result} = Tracer.compare_traces(trace_a_normalized, trace_b_normalized, opts)
+        send_json(conn, 200, %{success: true, data: result})
+
+      %{"trace_a" => _} ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: trace_b"})
+
+      %{"trace_b" => _} ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: trace_a"})
+
+      _ ->
+        send_json(conn, 400, %{
+          success: false,
+          error: "Missing required fields: trace_a, trace_b"
+        })
+    end
+  end
+
+  # POST /trace/analyze - Analyze a trace for insights
+  post "/trace/analyze" do
+    case conn.body_params do
+      %{"trace" => trace} = params ->
+        opts = parse_trace_analyze_options(params)
+        trace_normalized = normalize_trace_keys(trace)
+
+        {:ok, result} = Tracer.analyze_trace(trace_normalized, opts)
+        send_json(conn, 200, %{success: true, data: result})
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: trace"})
+    end
+  end
+
+  # GET /trace-config - Get default trace configuration
+  get "/trace-config" do
+    config = Tracer.default_config()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: config
+    })
+  end
+
+  # GET /trace-levels - Get available trace levels
+  get "/trace-levels" do
+    levels = Tracer.trace_levels()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: levels
     })
   end
 
@@ -626,6 +746,97 @@ defmodule Semanteq.Router do
   defp parse_inverse_fn("reciprocal"), do: :reciprocal
   defp parse_inverse_fn(fn_name) when is_binary(fn_name), do: String.to_existing_atom(fn_name)
   defp parse_inverse_fn(fn_atom) when is_atom(fn_atom), do: fn_atom
+
+  defp parse_trace_options(params) do
+    opts = %{}
+
+    opts =
+      if Map.has_key?(params, "level") do
+        level =
+          case params["level"] do
+            level when is_binary(level) -> String.to_existing_atom(level)
+            level when is_atom(level) -> level
+            _ -> :standard
+          end
+
+        Map.put(opts, :level, level)
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "include_source") do
+        Map.put(opts, :include_source, params["include_source"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "include_timestamps") do
+        Map.put(opts, :include_timestamps, params["include_timestamps"])
+      else
+        opts
+      end
+
+    if Map.has_key?(params, "max_depth") do
+      Map.put(opts, :max_depth, params["max_depth"])
+    else
+      opts
+    end
+  end
+
+  defp parse_trace_compare_options(params) do
+    opts = %{}
+
+    opts =
+      if Map.has_key?(params, "ignore_timing") do
+        Map.put(opts, :ignore_timing, params["ignore_timing"])
+      else
+        opts
+      end
+
+    if Map.has_key?(params, "compare_steps") do
+      Map.put(opts, :compare_steps, params["compare_steps"])
+    else
+      opts
+    end
+  end
+
+  defp parse_trace_analyze_options(params) do
+    if Map.has_key?(params, "include_hotspots") do
+      %{include_hotspots: params["include_hotspots"]}
+    else
+      %{}
+    end
+  end
+
+  defp normalize_trace_keys(trace) when is_map(trace) do
+    trace
+    |> Enum.map(fn
+      {k, v} when is_binary(k) ->
+        atom_key =
+          try do
+            String.to_existing_atom(k)
+          rescue
+            ArgumentError -> String.to_atom(k)
+          end
+
+        {atom_key, normalize_trace_value(v)}
+
+      {k, v} ->
+        {k, normalize_trace_value(v)}
+    end)
+    |> Map.new()
+  end
+
+  defp normalize_trace_keys(other), do: other
+
+  defp normalize_trace_value(value) when is_map(value), do: normalize_trace_keys(value)
+
+  defp normalize_trace_value(value) when is_list(value),
+    do: Enum.map(value, &normalize_trace_value/1)
+
+  defp normalize_trace_value(value), do: value
 
   defp format_error(%{step: step, reason: reason}) do
     "Failed at #{step}: #{inspect(reason)}"
