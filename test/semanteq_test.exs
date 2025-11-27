@@ -2,7 +2,7 @@ defmodule SemanteqTest do
   use ExUnit.Case
 
   alias Semanteq.{Glisp, Anthropic, Generator, Router, PropertyTester, Tracer, Provider}
-  alias Semanteq.Providers.Mock
+  alias Semanteq.Providers.{Mock, OpenAI}
 
   describe "Semanteq.Glisp" do
     test "project_dir returns configured path" do
@@ -770,6 +770,87 @@ defmodule SemanteqTest do
       assert refined["v"] == 42
       assert refined["m"]["refined"] == true
       assert refined["m"]["feedback"] =~ "Make it"
+    end
+  end
+
+  describe "Semanteq.Providers.OpenAI" do
+    test "name returns :openai" do
+      assert OpenAI.name() == :openai
+    end
+
+    test "config returns configuration" do
+      config = OpenAI.config()
+      assert is_list(config) or is_nil(config)
+    end
+
+    test "health_check returns configured when API key is set" do
+      # In test env, API key is "test-openai-api-key"
+      result = OpenAI.health_check()
+      assert {:ok, %{status: "configured", provider: :openai}} = result
+    end
+
+    test "generate_gexpr returns error when API key not configured" do
+      # Override config to simulate missing API key
+      original_config = Application.get_env(:semanteq, :openai)
+
+      try do
+        Application.put_env(:semanteq, :openai, api_key: nil)
+        result = OpenAI.generate_gexpr("test prompt")
+        assert {:error, :api_key_not_configured} = result
+      after
+        Application.put_env(:semanteq, :openai, original_config)
+      end
+    end
+
+    test "health_check returns error when API key not configured" do
+      original_config = Application.get_env(:semanteq, :openai)
+
+      try do
+        Application.put_env(:semanteq, :openai, api_key: nil)
+        result = OpenAI.health_check()
+        assert {:error, :api_key_not_configured} = result
+      after
+        Application.put_env(:semanteq, :openai, original_config)
+      end
+    end
+  end
+
+  describe "Provider with OpenAI" do
+    test "OpenAI is registered as a provider" do
+      providers = Provider.registered_providers()
+      assert Map.has_key?(providers, :openai)
+      assert providers[:openai] == Semanteq.Providers.OpenAI
+    end
+
+    test "can set OpenAI as active provider" do
+      original = Provider.get_active_name()
+
+      try do
+        assert :ok = Provider.set_active(:openai)
+        assert Provider.get_active_name() == :openai
+        assert Provider.get_active() == Semanteq.Providers.OpenAI
+      after
+        Provider.set_active(original)
+      end
+    end
+
+    test "with_provider works with OpenAI" do
+      original = Provider.get_active_name()
+
+      result =
+        Provider.with_provider(:openai, fn ->
+          assert Provider.get_active_name() == :openai
+          :openai_test_result
+        end)
+
+      assert result == :openai_test_result
+      assert Provider.get_active_name() == original
+    end
+
+    test "list_providers includes OpenAI" do
+      providers = Provider.list_providers()
+      assert Map.has_key?(providers, :openai)
+      assert providers[:openai].module == Semanteq.Providers.OpenAI
     end
   end
 end
