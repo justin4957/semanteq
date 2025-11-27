@@ -9,7 +9,8 @@ defmodule SemanteqTest do
     PropertyTester,
     Tracer,
     Provider,
-    ProviderComparison
+    ProviderComparison,
+    Session
   }
 
   alias Semanteq.Providers.{Mock, OpenAI, Ollama}
@@ -1184,6 +1185,277 @@ defmodule SemanteqTest do
       assert body["success"] == true
       assert body["data"]["has_differences"] == true
       assert length(body["data"]["diff"]) > 0
+    end
+  end
+
+  describe "Semanteq.Session" do
+    setup do
+      # Clear sessions before each test
+      Session.clear_all()
+      :ok
+    end
+
+    test "create returns session_id" do
+      {:ok, session_id} = Session.create()
+      assert is_binary(session_id)
+      assert byte_size(session_id) > 0
+    end
+
+    test "create with metadata stores metadata" do
+      {:ok, session_id} = Session.create(metadata: %{"user" => "test"})
+      {:ok, session} = Session.get(session_id)
+      assert session.metadata == %{"user" => "test"}
+    end
+
+    test "get returns session with entries" do
+      {:ok, session_id} = Session.create()
+      {:ok, session} = Session.get(session_id)
+
+      assert session.id == session_id
+      assert is_list(session.entries)
+      assert length(session.entries) == 0
+      assert %DateTime{} = session.created_at
+      assert %DateTime{} = session.expires_at
+    end
+
+    test "get returns error for nonexistent session" do
+      assert {:error, :not_found} = Session.get("nonexistent")
+    end
+
+    test "add_entry adds entry to session" do
+      {:ok, session_id} = Session.create()
+      entry = %{type: :generate, prompt: "test", result: %{gexpr: %{"g" => "lit", "v" => 42}}}
+
+      assert :ok = Session.add_entry(session_id, entry)
+
+      {:ok, session} = Session.get(session_id)
+      assert length(session.entries) == 1
+      assert hd(session.entries).type == :generate
+      assert hd(session.entries).prompt == "test"
+    end
+
+    test "add_entry returns error for nonexistent session" do
+      assert {:error, :not_found} = Session.add_entry("nonexistent", %{type: :test})
+    end
+
+    test "update_metadata merges with existing metadata" do
+      {:ok, session_id} = Session.create(metadata: %{"a" => 1})
+      :ok = Session.update_metadata(session_id, %{"b" => 2})
+
+      {:ok, session} = Session.get(session_id)
+      assert session.metadata == %{"a" => 1, "b" => 2}
+    end
+
+    test "touch refreshes session expiration" do
+      {:ok, session_id} = Session.create()
+      {:ok, session_before} = Session.get(session_id)
+
+      # Small delay to ensure time difference
+      Process.sleep(10)
+      :ok = Session.touch(session_id)
+
+      {:ok, session_after} = Session.get(session_id)
+      assert DateTime.compare(session_after.expires_at, session_before.expires_at) == :gt
+    end
+
+    test "delete removes session" do
+      {:ok, session_id} = Session.create()
+      :ok = Session.delete(session_id)
+      assert {:error, :not_found} = Session.get(session_id)
+    end
+
+    test "delete is idempotent" do
+      {:ok, session_id} = Session.create()
+      :ok = Session.delete(session_id)
+      :ok = Session.delete(session_id)
+    end
+
+    test "list returns all sessions without entries by default" do
+      {:ok, _} = Session.create(metadata: %{"name" => "session1"})
+      {:ok, _} = Session.create(metadata: %{"name" => "session2"})
+
+      sessions = Session.list()
+      assert length(sessions) == 2
+      # Should have entry_count but not entries
+      assert Enum.all?(sessions, &Map.has_key?(&1, :entry_count))
+      assert Enum.all?(sessions, &(not Map.has_key?(&1, :entries)))
+    end
+
+    test "list with include_entries returns full sessions" do
+      {:ok, session_id} = Session.create()
+      Session.add_entry(session_id, %{type: :test})
+
+      sessions = Session.list(include_entries: true)
+      assert length(sessions) == 1
+      assert hd(sessions).entries != nil
+    end
+
+    test "clear_all removes all sessions" do
+      {:ok, _} = Session.create()
+      {:ok, _} = Session.create()
+
+      :ok = Session.clear_all()
+      sessions = Session.list()
+      assert length(sessions) == 0
+    end
+
+    test "stats returns session statistics" do
+      {:ok, _} = Session.create()
+      {:ok, _} = Session.create()
+
+      stats = Session.stats()
+      assert stats.active_sessions == 2
+      assert is_integer(stats.total_created)
+      assert is_integer(stats.ttl_seconds)
+    end
+
+    test "default_config returns configuration" do
+      config = Session.default_config()
+      assert is_integer(config.ttl_seconds)
+      assert is_integer(config.max_entries_per_session)
+      assert is_integer(config.cleanup_interval_ms)
+    end
+  end
+
+  describe "Router session endpoints" do
+    setup do
+      Session.clear_all()
+      :ok
+    end
+
+    test "POST /sessions creates a session" do
+      conn =
+        :post
+        |> Plug.Test.conn("/sessions", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 201
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert is_binary(body["data"]["session_id"])
+    end
+
+    test "POST /sessions with metadata" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/sessions",
+          Jason.encode!(%{"metadata" => %{"user" => "test"}})
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 201
+      {:ok, body} = Jason.decode(conn.resp_body)
+      session_id = body["data"]["session_id"]
+
+      # Verify metadata was stored
+      {:ok, session} = Session.get(session_id)
+      assert session.metadata == %{"user" => "test"}
+    end
+
+    test "GET /sessions returns list of sessions" do
+      {:ok, _} = Session.create()
+      {:ok, _} = Session.create()
+
+      conn = Plug.Test.conn(:get, "/sessions")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["count"] == 2
+    end
+
+    test "GET /sessions/:id returns session" do
+      {:ok, session_id} = Session.create()
+
+      conn = Plug.Test.conn(:get, "/sessions/#{session_id}")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["id"] == session_id
+    end
+
+    test "GET /sessions/:id returns 404 for nonexistent session" do
+      conn = Plug.Test.conn(:get, "/sessions/nonexistent")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 404
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+    end
+
+    test "POST /sessions/:id/entries adds entry" do
+      {:ok, session_id} = Session.create()
+
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/sessions/#{session_id}/entries",
+          Jason.encode!(%{"type" => "generate", "prompt" => "test"})
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 201
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+    end
+
+    test "POST /sessions/:id/entries returns 404 for nonexistent session" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/sessions/nonexistent/entries",
+          Jason.encode!(%{"type" => "test"})
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 404
+    end
+
+    test "DELETE /sessions/:id deletes session" do
+      {:ok, session_id} = Session.create()
+
+      conn = Plug.Test.conn(:delete, "/sessions/#{session_id}")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+
+      assert {:error, :not_found} = Session.get(session_id)
+    end
+
+    test "GET /session-config returns configuration" do
+      conn = Plug.Test.conn(:get, "/session-config")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert is_integer(body["data"]["ttl_seconds"])
+    end
+
+    test "GET /session-stats returns statistics" do
+      {:ok, _} = Session.create()
+
+      conn = Plug.Test.conn(:get, "/session-stats")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["active_sessions"] == 1
     end
   end
 end

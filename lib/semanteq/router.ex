@@ -224,6 +224,46 @@ defmodule Semanteq.Router do
   }
   ```
 
+  ### POST /sessions
+  Create a new session.
+
+  Request body:
+  ```json
+  {"metadata": {"user": "test", "purpose": "evaluation"}}
+  ```
+
+  ### GET /sessions
+  List all active sessions.
+
+  Query params:
+  - `include_entries=true` - Include full history
+
+  ### GET /sessions/:id
+  Get a specific session with its history.
+
+  ### POST /sessions/:id/entries
+  Add an entry to a session's history.
+
+  Request body:
+  ```json
+  {"type": "generate", "prompt": "...", "result": {...}}
+  ```
+
+  ### PUT /sessions/:id/metadata
+  Update session metadata.
+
+  ### POST /sessions/:id/touch
+  Refresh session expiration.
+
+  ### DELETE /sessions/:id
+  Delete a session.
+
+  ### GET /session-config
+  Get session configuration (TTL, max entries).
+
+  ### GET /session-stats
+  Get session statistics.
+
   ### GET /health
   Health check endpoint.
   """
@@ -237,7 +277,8 @@ defmodule Semanteq.Router do
     PropertyTester,
     Tracer,
     Provider,
-    ProviderComparison
+    ProviderComparison,
+    Session
   }
 
   plug(Plug.Logger)
@@ -740,6 +781,118 @@ defmodule Semanteq.Router do
           error: "Missing required fields: gexpr_a, gexpr_b"
         })
     end
+  end
+
+  # ============================================================================
+  # Session Management Endpoints
+  # ============================================================================
+
+  # POST /sessions - Create a new session
+  post "/sessions" do
+    metadata = Map.get(conn.body_params, "metadata", %{})
+    {:ok, session_id} = Session.create(metadata: metadata)
+
+    send_json(conn, 201, %{
+      success: true,
+      data: %{
+        session_id: session_id,
+        message: "Session created"
+      }
+    })
+  end
+
+  # GET /sessions - List all sessions
+  get "/sessions" do
+    include_entries = Map.get(conn.query_params, "include_entries", "false") == "true"
+    sessions = Session.list(include_entries: include_entries)
+
+    send_json(conn, 200, %{
+      success: true,
+      data: %{
+        sessions: sessions,
+        count: length(sessions)
+      }
+    })
+  end
+
+  # GET /sessions/:id - Get a specific session
+  get "/sessions/:id" do
+    case Session.get(id) do
+      {:ok, session} ->
+        send_json(conn, 200, %{success: true, data: session})
+
+      {:error, :not_found} ->
+        send_json(conn, 404, %{success: false, error: "Session not found"})
+    end
+  end
+
+  # POST /sessions/:id/entries - Add an entry to a session
+  post "/sessions/:id/entries" do
+    case conn.body_params do
+      entry when map_size(entry) > 0 ->
+        case Session.add_entry(id, entry) do
+          :ok ->
+            send_json(conn, 201, %{success: true, message: "Entry added"})
+
+          {:error, :not_found} ->
+            send_json(conn, 404, %{success: false, error: "Session not found"})
+
+          {:error, :max_entries_reached} ->
+            send_json(conn, 400, %{
+              success: false,
+              error: "Maximum entries reached for this session"
+            })
+        end
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Entry data required"})
+    end
+  end
+
+  # PUT /sessions/:id/metadata - Update session metadata
+  put "/sessions/:id/metadata" do
+    case conn.body_params do
+      metadata when map_size(metadata) > 0 ->
+        case Session.update_metadata(id, metadata) do
+          :ok ->
+            send_json(conn, 200, %{success: true, message: "Metadata updated"})
+
+          {:error, :not_found} ->
+            send_json(conn, 404, %{success: false, error: "Session not found"})
+        end
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Metadata required"})
+    end
+  end
+
+  # POST /sessions/:id/touch - Refresh session expiration
+  post "/sessions/:id/touch" do
+    case Session.touch(id) do
+      :ok ->
+        send_json(conn, 200, %{success: true, message: "Session refreshed"})
+
+      {:error, :not_found} ->
+        send_json(conn, 404, %{success: false, error: "Session not found"})
+    end
+  end
+
+  # DELETE /sessions/:id - Delete a session
+  delete "/sessions/:id" do
+    :ok = Session.delete(id)
+    send_json(conn, 200, %{success: true, message: "Session deleted"})
+  end
+
+  # GET /session-config - Get session configuration
+  get "/session-config" do
+    config = Session.default_config()
+    send_json(conn, 200, %{success: true, data: config})
+  end
+
+  # GET /session-stats - Get session statistics
+  get "/session-stats" do
+    stats = Session.stats()
+    send_json(conn, 200, %{success: true, data: stats})
   end
 
   # GET /health - Health check endpoint
