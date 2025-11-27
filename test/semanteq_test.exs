@@ -1,7 +1,8 @@
 defmodule SemanteqTest do
   use ExUnit.Case
 
-  alias Semanteq.{Glisp, Anthropic, Generator, Router, PropertyTester, Tracer}
+  alias Semanteq.{Glisp, Anthropic, Generator, Router, PropertyTester, Tracer, Provider}
+  alias Semanteq.Providers.Mock
 
   describe "Semanteq.Glisp" do
     test "project_dir returns configured path" do
@@ -585,6 +586,190 @@ defmodule SemanteqTest do
       assert conn.status == 404
       {:ok, body} = Jason.decode(conn.resp_body)
       assert body["error"] == "Not found"
+    end
+
+    test "GET /providers returns list of providers" do
+      conn = Plug.Test.conn(:get, "/providers")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert is_map(body["data"]["providers"])
+      assert body["data"]["active"] in ["anthropic", "mock"]
+    end
+
+    test "GET /provider returns active provider" do
+      conn = Plug.Test.conn(:get, "/provider")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert is_binary(body["data"]["name"])
+      assert is_binary(body["data"]["module"])
+    end
+
+    test "PUT /provider with invalid provider returns 400" do
+      conn =
+        :put
+        |> Plug.Test.conn("/provider", Jason.encode!(%{"provider" => "nonexistent"}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "Unknown provider"
+      assert is_list(body["available_providers"])
+    end
+
+    test "PUT /provider without provider field returns 400" do
+      conn =
+        :put
+        |> Plug.Test.conn("/provider", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "provider"
+    end
+  end
+
+  describe "Semanteq.Provider" do
+    test "registered_providers returns a map" do
+      providers = Provider.registered_providers()
+      assert is_map(providers)
+      assert Map.has_key?(providers, :anthropic)
+      assert Map.has_key?(providers, :mock)
+    end
+
+    test "get_active returns a module" do
+      module = Provider.get_active()
+      assert is_atom(module)
+    end
+
+    test "get_active_name returns an atom" do
+      name = Provider.get_active_name()
+      assert is_atom(name)
+      assert name in [:anthropic, :mock]
+    end
+
+    test "set_active with valid provider returns :ok" do
+      original = Provider.get_active_name()
+
+      try do
+        assert :ok = Provider.set_active(:mock)
+        assert Provider.get_active_name() == :mock
+      after
+        Provider.set_active(original)
+      end
+    end
+
+    test "set_active with invalid provider returns error" do
+      assert {:error, :unknown_provider} = Provider.set_active(:nonexistent)
+    end
+
+    test "reset_active restores default provider" do
+      Provider.set_active(:mock)
+      Provider.reset_active()
+      # After reset, it should use config default
+      assert is_atom(Provider.get_active_name())
+    end
+
+    test "with_provider temporarily switches provider" do
+      original = Provider.get_active_name()
+
+      result =
+        Provider.with_provider(:mock, fn ->
+          assert Provider.get_active_name() == :mock
+          :test_result
+        end)
+
+      assert result == :test_result
+      # Provider should be restored after the block
+      assert Provider.get_active_name() == original
+    end
+
+    test "list_providers returns all providers with active status" do
+      providers = Provider.list_providers()
+      assert is_map(providers)
+      assert Map.has_key?(providers, :anthropic)
+      assert Map.has_key?(providers, :mock)
+
+      Enum.each(providers, fn {_name, info} ->
+        assert Map.has_key?(info, :module)
+        assert Map.has_key?(info, :active)
+      end)
+    end
+
+    test "health_check delegates to active provider" do
+      result = Provider.health_check()
+      assert match?({:ok, _}, result) or match?({:error, _}, result)
+    end
+  end
+
+  describe "Semanteq.Providers.Mock" do
+    test "name returns :mock" do
+      assert Mock.name() == :mock
+    end
+
+    test "health_check returns ok status" do
+      assert {:ok, %{status: "ok", provider: :mock}} = Mock.health_check()
+    end
+
+    test "generate_gexpr returns deterministic response for double prompt" do
+      {:ok, gexpr} = Mock.generate_gexpr("Create a function that doubles a number")
+      assert gexpr["g"] == "lam"
+      assert gexpr["v"]["params"] == ["x"]
+    end
+
+    test "generate_gexpr returns deterministic response for add prompt" do
+      {:ok, gexpr} = Mock.generate_gexpr("Create a function that adds two numbers")
+      assert gexpr["g"] == "lam"
+      assert gexpr["v"]["params"] == ["a", "b"]
+    end
+
+    test "generate_gexpr returns default for unknown prompt" do
+      {:ok, gexpr} = Mock.generate_gexpr("Something random")
+      assert gexpr["g"] == "lit"
+      assert gexpr["v"] == 42
+    end
+
+    test "generate_gexpr with should_fail option returns error" do
+      assert {:error, :mock_generation_failed} = Mock.generate_gexpr("test", should_fail: true)
+    end
+
+    test "generate_gexpr with custom mock_response uses it" do
+      custom = %{"g" => "custom", "v" => "test"}
+      {:ok, gexpr} = Mock.generate_gexpr("test", mock_response: custom)
+      assert gexpr == custom
+    end
+
+    test "validate_gexpr returns valid for proper gexpr" do
+      {:ok, result} = Mock.validate_gexpr(%{"g" => "lit", "v" => 42})
+      assert result.valid == true
+      assert result.issues == []
+    end
+
+    test "validate_gexpr returns invalid for improper gexpr" do
+      {:ok, result} = Mock.validate_gexpr(%{"invalid" => "structure"})
+      assert result.valid == false
+      assert length(result.issues) > 0
+    end
+
+    test "refine_gexpr adds metadata to expression" do
+      original = %{"g" => "lit", "v" => 42}
+      {:ok, refined} = Mock.refine_gexpr(original, "Make it better")
+
+      assert refined["g"] == "lit"
+      assert refined["v"] == 42
+      assert refined["m"]["refined"] == true
+      assert refined["m"]["feedback"] =~ "Make it"
     end
   end
 end
