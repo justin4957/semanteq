@@ -2,7 +2,8 @@ defmodule Semanteq.Application do
   @moduledoc """
   OTP Application for Semanteq.
 
-  Starts the HTTP server on the configured port (default 4001).
+  Starts the HTTP server on the configured port (default 4001)
+  and the session manager for tracking generation history.
   """
 
   use Application
@@ -15,6 +16,9 @@ defmodule Semanteq.Application do
     port = Keyword.get(http_config, :port, 4001)
 
     children = [
+      # Session manager (ETS-based)
+      Semanteq.Session,
+      # HTTP server
       {Plug.Cowboy, scheme: :http, plug: Semanteq.Router, options: [port: port]}
     ]
 
