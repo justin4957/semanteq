@@ -4,11 +4,33 @@ defmodule Semanteq.Generator do
 
   Combines LLM-based code generation with G-Lisp evaluation and testing
   to produce validated G-expressions from natural language prompts.
+
+  ## Retry Configuration
+
+  The generator supports automatic retry with feedback when generation fails:
+
+  - `:max_retries` - Maximum number of retry attempts (default: 3)
+  - `:retry_on` - List of failure types to retry on (default: [:generate, :evaluate, :test])
+  - `:backoff_ms` - Base backoff time between retries in ms (default: 100)
+  - `:exponential_backoff` - Whether to use exponential backoff (default: true)
+
+  ## Example
+
+      opts = %{
+        max_retries: 5,
+        retry_on: [:evaluate, :test],
+        backoff_ms: 200
+      }
+      {:ok, result} = Semanteq.Generator.generate_with_retry("Create a factorial function", opts)
   """
 
   require Logger
 
   alias Semanteq.{Anthropic, Glisp}
+
+  @default_max_retries 3
+  @default_retry_on [:generate, :evaluate, :test]
+  @default_backoff_ms 100
 
   @doc """
   Generates and tests a G-expression from a natural language prompt.
@@ -62,6 +84,119 @@ defmodule Semanteq.Generator do
       {:error, reason} ->
         Logger.error("Generation pipeline failed: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  @doc """
+  Generates and tests a G-expression with automatic retry on failure.
+
+  This function wraps `generate_and_test/2` with a configurable retry mechanism.
+  When a failure occurs, it feeds the error back to the LLM to generate an
+  improved G-expression.
+
+  ## Parameters
+    - prompt: Natural language description of the desired code
+    - opts: Options map with:
+      - `:max_retries` - Maximum retry attempts (default: 3)
+      - `:retry_on` - List of failure steps to retry (default: [:generate, :evaluate, :test])
+      - `:backoff_ms` - Base backoff time in milliseconds (default: 100)
+      - `:exponential_backoff` - Use exponential backoff (default: true)
+      - Plus all options from `generate_and_test/2`
+
+  ## Returns
+    - `{:ok, result}` with generation results and retry metrics
+    - `{:error, reason}` if all retries exhausted
+
+  ## Examples
+
+      iex> Semanteq.Generator.generate_with_retry("Create a factorial function", %{max_retries: 5})
+      {:ok, %{
+        prompt: "Create a factorial function",
+        gexpr: %{"g" => "lam", ...},
+        evaluation: %{result: ...},
+        tests: %{passed: 3, failed: 0},
+        retry_metrics: %{
+          attempts: 2,
+          success_on_attempt: 2,
+          total_time_ms: 1523,
+          retries: [%{attempt: 1, step: :evaluate, error: "..."}]
+        }
+      }}
+  """
+  def generate_with_retry(prompt, opts \\ %{}) do
+    max_retries = Map.get(opts, :max_retries, @default_max_retries)
+    retry_on = Map.get(opts, :retry_on, @default_retry_on)
+    backoff_ms = Map.get(opts, :backoff_ms, @default_backoff_ms)
+    exponential_backoff = Map.get(opts, :exponential_backoff, true)
+
+    start_time = System.monotonic_time(:millisecond)
+
+    retry_state = %{
+      attempts: 0,
+      retries: [],
+      last_gexpr: nil,
+      last_error: nil
+    }
+
+    result =
+      do_generate_with_retry(
+        prompt,
+        opts,
+        max_retries + 1,
+        retry_on,
+        backoff_ms,
+        exponential_backoff,
+        retry_state
+      )
+
+    end_time = System.monotonic_time(:millisecond)
+    total_time_ms = end_time - start_time
+
+    case result do
+      {:ok, generation_result, final_state} ->
+        metrics = %{
+          attempts: final_state.attempts,
+          success_on_attempt: final_state.attempts,
+          total_time_ms: total_time_ms,
+          retries: Enum.reverse(final_state.retries)
+        }
+
+        {:ok, Map.put(generation_result, :retry_metrics, metrics)}
+
+      {:error, reason, final_state} ->
+        metrics = %{
+          attempts: final_state.attempts,
+          success_on_attempt: nil,
+          total_time_ms: total_time_ms,
+          retries: Enum.reverse(final_state.retries)
+        }
+
+        {:error, %{reason: reason, retry_metrics: metrics}}
+    end
+  end
+
+  @doc """
+  Generates and refines a G-expression with feedback loop.
+
+  Attempts to generate a valid G-expression, and if evaluation fails,
+  refines the expression up to `max_retries` times.
+
+  ## Parameters
+    - prompt: Natural language description
+    - opts: Options with optional `:max_retries` (default 3)
+
+  ## Returns
+    - `{:ok, result}` with final successful result
+    - `{:error, reason}` if all retries exhausted
+
+  Note: Consider using `generate_with_retry/2` for more detailed metrics.
+  """
+  def generate_with_refinement(prompt, opts \\ %{}) do
+    # Delegate to the new retry function for backwards compatibility
+    case generate_with_retry(prompt, opts) do
+      {:ok, result} -> {:ok, Map.delete(result, :retry_metrics)}
+      {:error, %{reason: reason}} -> {:error, reason}
+      {:error, _} = error -> error
     end
   end
 
@@ -157,25 +292,145 @@ defmodule Semanteq.Generator do
   end
 
   @doc """
-  Generates and refines a G-expression with feedback loop.
-
-  Attempts to generate a valid G-expression, and if evaluation fails,
-  refines the expression up to `max_retries` times.
-
-  ## Parameters
-    - prompt: Natural language description
-    - opts: Options with optional `:max_retries` (default 3)
-
-  ## Returns
-    - `{:ok, result}` with final successful result
-    - `{:error, reason}` if all retries exhausted
+  Returns the default retry configuration.
   """
-  def generate_with_refinement(prompt, opts \\ %{}) do
-    max_retries = Map.get(opts, :max_retries, 3)
-    do_generate_with_refinement(prompt, opts, max_retries, [])
+  def default_retry_config do
+    %{
+      max_retries: @default_max_retries,
+      retry_on: @default_retry_on,
+      backoff_ms: @default_backoff_ms,
+      exponential_backoff: true
+    }
   end
 
   # Private functions
+
+  defp do_generate_with_retry(_prompt, _opts, 0, _retry_on, _backoff_ms, _exp, state) do
+    {:error, :max_retries_exceeded, state}
+  end
+
+  defp do_generate_with_retry(
+         prompt,
+         opts,
+         retries_left,
+         retry_on,
+         backoff_ms,
+         exp_backoff,
+         state
+       ) do
+    current_attempt = state.attempts + 1
+    state = %{state | attempts: current_attempt}
+
+    Logger.debug("Generation attempt #{current_attempt}")
+
+    # If we have a refined gexpr from a previous attempt, use it
+    generation_opts =
+      if state.last_gexpr do
+        # Feed back the error to improve the prompt
+        enhanced_prompt = build_enhanced_prompt(prompt, state.last_error)
+        Map.put(opts, :enhanced_prompt, enhanced_prompt)
+      else
+        opts
+      end
+
+    prompt_to_use =
+      if Map.has_key?(generation_opts, :enhanced_prompt) do
+        generation_opts.enhanced_prompt
+      else
+        prompt
+      end
+
+    case generate_and_test(prompt_to_use, Map.delete(generation_opts, :enhanced_prompt)) do
+      {:ok, result} ->
+        Logger.info("Generation succeeded on attempt #{current_attempt}")
+        {:ok, result, state}
+
+      {:error, %{step: step, reason: reason}} ->
+        if step in retry_on and retries_left > 1 do
+          Logger.warning(
+            "Generation failed at #{step} on attempt #{current_attempt}, retrying... (#{retries_left - 1} retries left)"
+          )
+
+          # Record this retry attempt
+          retry_info = %{
+            attempt: current_attempt,
+            step: step,
+            error: format_error_for_feedback(reason),
+            timestamp: DateTime.utc_now()
+          }
+
+          state = %{
+            state
+            | retries: [retry_info | state.retries],
+              last_error: %{step: step, reason: reason}
+          }
+
+          # Apply backoff
+          backoff = calculate_backoff(current_attempt, backoff_ms, exp_backoff)
+          Process.sleep(backoff)
+
+          do_generate_with_retry(
+            prompt,
+            opts,
+            retries_left - 1,
+            retry_on,
+            backoff_ms,
+            exp_backoff,
+            state
+          )
+        else
+          if step not in retry_on do
+            Logger.warning("Generation failed at #{step}, not configured to retry on this step")
+          end
+
+          {:error, %{step: step, reason: reason}, state}
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp build_enhanced_prompt(original_prompt, %{step: step, reason: reason}) do
+    feedback = build_feedback(step, reason)
+
+    """
+    #{original_prompt}
+
+    IMPORTANT: A previous attempt failed with the following error:
+    #{feedback}
+
+    Please generate a corrected G-expression that addresses this issue.
+    Ensure the expression is syntactically valid and will evaluate correctly.
+    """
+  end
+
+  defp build_enhanced_prompt(original_prompt, _), do: original_prompt
+
+  defp calculate_backoff(attempt, base_ms, true = _exponential) do
+    # Exponential backoff with jitter
+    base = base_ms * :math.pow(2, attempt - 1)
+    jitter = :rand.uniform(round(base * 0.1))
+    round(base + jitter)
+  end
+
+  defp calculate_backoff(_attempt, base_ms, false = _exponential) do
+    base_ms
+  end
+
+  defp format_error_for_feedback(reason) when is_binary(reason), do: reason
+  defp format_error_for_feedback(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp format_error_for_feedback(%{output: output}) when is_binary(output) do
+    # Truncate long error outputs
+    if String.length(output) > 500 do
+      String.slice(output, 0, 500) <> "..."
+    else
+      output
+    end
+  end
+
+  defp format_error_for_feedback(reason), do: inspect(reason, limit: 5)
 
   defp run_schema_tests(gexpr, schema, opts) do
     case Glisp.generate_tests(schema, opts) do
@@ -263,57 +518,19 @@ defmodule Semanteq.Generator do
     }
   end
 
-  defp do_generate_with_refinement(_prompt, _opts, 0, attempts) do
-    {:error, %{reason: :max_retries_exceeded, attempts: Enum.reverse(attempts)}}
-  end
-
-  defp do_generate_with_refinement(prompt, opts, retries_left, attempts) do
-    case generate_and_test(prompt, opts) do
-      {:ok, result} ->
-        {:ok, result}
-
-      {:error, %{step: step, reason: reason}} = error ->
-        attempt = %{
-          retry: length(attempts) + 1,
-          step: step,
-          error: reason
-        }
-
-        # Try to refine based on the error
-        feedback = build_feedback(step, reason)
-
-        case Anthropic.generate_gexpr("#{prompt}\n\nPrevious attempt failed: #{feedback}") do
-          {:ok, refined_gexpr} ->
-            # Store this attempt
-            new_attempts = [Map.put(attempt, :refined_gexpr, refined_gexpr) | attempts]
-
-            # Try again with the refined expression
-            refined_opts = Map.put(opts, :gexpr_override, refined_gexpr)
-            do_generate_with_refinement(prompt, refined_opts, retries_left - 1, new_attempts)
-
-          {:error, _} ->
-            # Refinement failed, return original error
-            error
-        end
-
-      {:error, _} = error ->
-        error
-    end
-  end
-
   defp build_feedback(:generate, reason) do
-    "Failed to generate valid G-expression: #{inspect(reason)}"
+    "Failed to generate valid G-expression: #{format_error_for_feedback(reason)}"
   end
 
   defp build_feedback(:evaluate, reason) do
-    "G-expression evaluation failed: #{inspect(reason)}"
+    "G-expression evaluation failed: #{format_error_for_feedback(reason)}"
   end
 
   defp build_feedback(:test, reason) do
-    "Tests failed: #{inspect(reason)}"
+    "Tests failed: #{format_error_for_feedback(reason)}"
   end
 
   defp build_feedback(_step, reason) do
-    "Error: #{inspect(reason)}"
+    "Error: #{format_error_for_feedback(reason)}"
   end
 end

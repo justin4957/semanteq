@@ -54,6 +54,22 @@ defmodule Semanteq.Router do
   {"gexpr": {...}, "feedback": "Handle negative numbers"}
   ```
 
+  ### POST /generate-with-retry
+  Generate G-expression with automatic retry on failure.
+
+  Request body:
+  ```json
+  {
+    "prompt": "Create a factorial function",
+    "max_retries": 3,
+    "retry_on": ["generate", "evaluate", "test"],
+    "backoff_ms": 100
+  }
+  ```
+
+  ### GET /retry-config
+  Get default retry configuration.
+
   ### GET /health
   Health check endpoint.
   """
@@ -196,6 +212,40 @@ defmodule Semanteq.Router do
     end
   end
 
+  # POST /generate-with-retry - Generate with automatic retry on failure
+  post "/generate-with-retry" do
+    case conn.body_params do
+      %{"prompt" => prompt} = params ->
+        opts = parse_retry_options(params)
+
+        case Generator.generate_with_retry(prompt, opts) do
+          {:ok, result} ->
+            send_json(conn, 200, %{success: true, data: result})
+
+          {:error, reason} ->
+            send_json(conn, 422, %{success: false, error: format_error(reason)})
+        end
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: prompt"})
+    end
+  end
+
+  # GET /retry-config - Get default retry configuration
+  get "/retry-config" do
+    config = Generator.default_retry_config()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: %{
+        max_retries: config.max_retries,
+        retry_on: Enum.map(config.retry_on, &Atom.to_string/1),
+        backoff_ms: config.backoff_ms,
+        exponential_backoff: config.exponential_backoff
+      }
+    })
+  end
+
   # GET /health - Health check endpoint
   get "/health" do
     glisp_status = check_glisp_health()
@@ -249,6 +299,41 @@ defmodule Semanteq.Router do
 
     if Map.get(params, "with_trace", false) do
       Map.put(opts, :with_trace, true)
+    else
+      opts
+    end
+  end
+
+  defp parse_retry_options(params) do
+    opts = parse_options(params)
+
+    opts =
+      if Map.has_key?(params, "max_retries") do
+        Map.put(opts, :max_retries, params["max_retries"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "retry_on") do
+        retry_on =
+          params["retry_on"]
+          |> Enum.map(&String.to_existing_atom/1)
+
+        Map.put(opts, :retry_on, retry_on)
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "backoff_ms") do
+        Map.put(opts, :backoff_ms, params["backoff_ms"])
+      else
+        opts
+      end
+
+    if Map.has_key?(params, "exponential_backoff") do
+      Map.put(opts, :exponential_backoff, params["exponential_backoff"])
     else
       opts
     end
