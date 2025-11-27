@@ -418,6 +418,14 @@ defmodule Semanteq.Tracer do
   defp compare_trace_steps(steps_a, steps_b) do
     max_len = max(length(steps_a), length(steps_b))
 
+    if max_len == 0 do
+      {[], nil}
+    else
+      compare_trace_steps_range(steps_a, steps_b, max_len)
+    end
+  end
+
+  defp compare_trace_steps_range(steps_a, steps_b, max_len) do
     {differences, first_divergence} =
       Enum.reduce(0..(max_len - 1), {[], nil}, fn index, {diffs, first_div} ->
         step_a = Enum.at(steps_a, index)

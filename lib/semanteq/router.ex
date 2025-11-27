@@ -350,13 +350,8 @@ defmodule Semanteq.Router do
         opts = parse_batch_options(conn.body_params)
 
         try do
-          case Generator.batch_generate_from_json(prompts, opts) do
-            {:ok, result} ->
-              send_json(conn, 200, %{success: true, data: result})
-
-            {:error, reason} ->
-              send_json(conn, 422, %{success: false, error: format_error(reason)})
-          end
+          {:ok, result} = Generator.batch_generate_from_json(prompts, opts)
+          send_json(conn, 200, %{success: true, data: result})
         rescue
           ArgumentError ->
             send_json(conn, 400, %{
@@ -417,13 +412,8 @@ defmodule Semanteq.Router do
         opts = parse_property_options(params)
         parsed_properties = Enum.map(properties, &parse_property/1)
 
-        case PropertyTester.test_properties(gexpr, parsed_properties, opts) do
-          {:ok, result} ->
-            send_json(conn, 200, %{success: true, data: result})
-
-          {:error, reason} ->
-            send_json(conn, 422, %{success: false, error: format_error(reason)})
-        end
+        {:ok, result} = PropertyTester.test_properties(gexpr, parsed_properties, opts)
+        send_json(conn, 200, %{success: true, data: result})
 
       %{"gexpr" => _gexpr, "properties" => _} ->
         send_json(conn, 400, %{success: false, error: "Field 'properties' must be an array"})
@@ -504,13 +494,8 @@ defmodule Semanteq.Router do
         trace_a_normalized = normalize_trace_keys(trace_a)
         trace_b_normalized = normalize_trace_keys(trace_b)
 
-        case Tracer.compare_traces(trace_a_normalized, trace_b_normalized, opts) do
-          {:ok, result} ->
-            send_json(conn, 200, %{success: true, data: result})
-
-          {:error, reason} ->
-            send_json(conn, 422, %{success: false, error: format_error(reason)})
-        end
+        {:ok, result} = Tracer.compare_traces(trace_a_normalized, trace_b_normalized, opts)
+        send_json(conn, 200, %{success: true, data: result})
 
       %{"trace_a" => _} ->
         send_json(conn, 400, %{success: false, error: "Missing required field: trace_b"})
@@ -533,13 +518,8 @@ defmodule Semanteq.Router do
         opts = parse_trace_analyze_options(params)
         trace_normalized = normalize_trace_keys(trace)
 
-        case Tracer.analyze_trace(trace_normalized, opts) do
-          {:ok, result} ->
-            send_json(conn, 200, %{success: true, data: result})
-
-          {:error, reason} ->
-            send_json(conn, 422, %{success: false, error: format_error(reason)})
-        end
+        {:ok, result} = Tracer.analyze_trace(trace_normalized, opts)
+        send_json(conn, 200, %{success: true, data: result})
 
       _ ->
         send_json(conn, 400, %{success: false, error: "Missing required field: trace"})
