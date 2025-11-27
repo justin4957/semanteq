@@ -167,13 +167,38 @@ defmodule Semanteq.Router do
   ### GET /trace-levels
   Get available trace levels and descriptions.
 
+  ### GET /providers
+  List all registered providers.
+
+  Response:
+  ```json
+  {
+    "success": true,
+    "data": {
+      "providers": {"anthropic": {"module": "...", "active": true}, ...},
+      "active": "anthropic"
+    }
+  }
+  ```
+
+  ### GET /provider
+  Get the currently active provider.
+
+  ### PUT /provider
+  Set the active provider for this request context.
+
+  Request body:
+  ```json
+  {"provider": "mock"}
+  ```
+
   ### GET /health
   Health check endpoint.
   """
 
   use Plug.Router
 
-  alias Semanteq.{Generator, Glisp, Anthropic, PropertyTester, Tracer}
+  alias Semanteq.{Generator, Glisp, Anthropic, PropertyTester, Tracer, Provider}
 
   plug(Plug.Logger)
 
@@ -546,10 +571,83 @@ defmodule Semanteq.Router do
     })
   end
 
+  # GET /providers - List all registered providers
+  get "/providers" do
+    providers = Provider.list_providers()
+
+    formatted_providers =
+      Enum.map(providers, fn {name, info} ->
+        {Atom.to_string(name),
+         %{
+           module: inspect(info.module),
+           active: info.active
+         }}
+      end)
+      |> Map.new()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: %{
+        providers: formatted_providers,
+        active: Atom.to_string(Provider.get_active_name())
+      }
+    })
+  end
+
+  # GET /provider - Get the currently active provider
+  get "/provider" do
+    provider_name = Provider.get_active_name()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: %{
+        name: Atom.to_string(provider_name),
+        module: inspect(Provider.get_active())
+      }
+    })
+  end
+
+  # PUT /provider - Set the active provider for this process
+  put "/provider" do
+    case conn.body_params do
+      %{"provider" => provider_name} when is_binary(provider_name) ->
+        provider_atom =
+          try do
+            String.to_existing_atom(provider_name)
+          rescue
+            ArgumentError -> String.to_atom(provider_name)
+          end
+
+        case Provider.set_active(provider_atom) do
+          :ok ->
+            send_json(conn, 200, %{
+              success: true,
+              data: %{
+                active: provider_name,
+                message: "Provider switched to #{provider_name}"
+              }
+            })
+
+          {:error, :unknown_provider} ->
+            available =
+              Provider.registered_providers() |> Map.keys() |> Enum.map(&Atom.to_string/1)
+
+            send_json(conn, 400, %{
+              success: false,
+              error: "Unknown provider: #{provider_name}",
+              available_providers: available
+            })
+        end
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: provider"})
+    end
+  end
+
   # GET /health - Health check endpoint
   get "/health" do
     glisp_status = check_glisp_health()
-    anthropic_status = check_anthropic_health()
+    provider_status = check_provider_health()
 
     overall_status =
       if glisp_status[:status] == "ok" do
@@ -562,7 +660,7 @@ defmodule Semanteq.Router do
       status: overall_status,
       services: %{
         glisp: glisp_status,
-        anthropic: anthropic_status
+        provider: provider_status
       }
     })
   end
@@ -861,10 +959,20 @@ defmodule Semanteq.Router do
     end
   end
 
-  defp check_anthropic_health do
-    case Anthropic.health_check() do
-      {:ok, info} -> Map.merge(%{status: "ok"}, info)
-      {:error, reason} -> %{status: "error", error: format_error(reason)}
+  defp check_provider_health do
+    case Provider.health_check() do
+      {:ok, info} ->
+        Map.merge(
+          %{status: "ok", active_provider: Atom.to_string(Provider.get_active_name())},
+          info
+        )
+
+      {:error, reason} ->
+        %{
+          status: "error",
+          active_provider: Atom.to_string(Provider.get_active_name()),
+          error: format_error(reason)
+        }
     end
   end
 end
