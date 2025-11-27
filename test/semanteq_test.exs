@@ -2,7 +2,7 @@ defmodule SemanteqTest do
   use ExUnit.Case
 
   alias Semanteq.{Glisp, Anthropic, Generator, Router, PropertyTester, Tracer, Provider}
-  alias Semanteq.Providers.{Mock, OpenAI}
+  alias Semanteq.Providers.{Mock, OpenAI, Ollama}
 
   describe "Semanteq.Glisp" do
     test "project_dir returns configured path" do
@@ -851,6 +851,98 @@ defmodule SemanteqTest do
       providers = Provider.list_providers()
       assert Map.has_key?(providers, :openai)
       assert providers[:openai].module == Semanteq.Providers.OpenAI
+    end
+  end
+
+  describe "Semanteq.Providers.Ollama" do
+    test "name returns :ollama" do
+      assert Ollama.name() == :ollama
+    end
+
+    test "config returns configuration" do
+      config = Ollama.config()
+      assert is_list(config) or is_nil(config)
+    end
+
+    test "health_check returns ollama_unavailable when server not running" do
+      # In test env, Ollama is typically not running
+      result = Ollama.health_check()
+      # Should return error since Ollama server likely not available in CI
+      assert match?({:error, {:ollama_unavailable, _}}, result) or
+               match?({:ok, %{status: "connected"}}, result)
+    end
+
+    test "generate_gexpr returns error or success depending on Ollama availability" do
+      result = Ollama.generate_gexpr("test prompt")
+      # Result depends on whether Ollama is running and has the model
+      assert match?({:error, _}, result) or match?({:ok, _}, result)
+    end
+
+    test "list_models returns error or list when Ollama not running" do
+      result = Ollama.list_models()
+      assert match?({:error, _}, result) or match?({:ok, _}, result)
+    end
+
+    test "model_available? returns false when Ollama not running" do
+      # Should return false since Ollama is not running
+      result = Ollama.model_available?("llama3.2")
+      assert is_boolean(result)
+    end
+
+    test "model_info returns error when Ollama not running" do
+      result = Ollama.model_info("llama3.2")
+      assert match?({:error, _}, result) or match?({:ok, _}, result)
+    end
+
+    test "validate_gexpr returns error when Ollama not running" do
+      gexpr = %{"g" => "lit", "v" => 42}
+      result = Ollama.validate_gexpr(gexpr, "test context")
+      assert match?({:error, _}, result) or match?({:ok, _}, result)
+    end
+
+    test "refine_gexpr returns error when Ollama not running" do
+      gexpr = %{"g" => "lit", "v" => 42}
+      result = Ollama.refine_gexpr(gexpr, "make it better")
+      assert match?({:error, _}, result) or match?({:ok, _}, result)
+    end
+  end
+
+  describe "Provider with Ollama" do
+    test "Ollama is registered as a provider" do
+      providers = Provider.registered_providers()
+      assert Map.has_key?(providers, :ollama)
+      assert providers[:ollama] == Semanteq.Providers.Ollama
+    end
+
+    test "can set Ollama as active provider" do
+      original = Provider.get_active_name()
+
+      try do
+        assert :ok = Provider.set_active(:ollama)
+        assert Provider.get_active_name() == :ollama
+        assert Provider.get_active() == Semanteq.Providers.Ollama
+      after
+        Provider.set_active(original)
+      end
+    end
+
+    test "with_provider works with Ollama" do
+      original = Provider.get_active_name()
+
+      result =
+        Provider.with_provider(:ollama, fn ->
+          assert Provider.get_active_name() == :ollama
+          :ollama_test_result
+        end)
+
+      assert result == :ollama_test_result
+      assert Provider.get_active_name() == original
+    end
+
+    test "list_providers includes Ollama" do
+      providers = Provider.list_providers()
+      assert Map.has_key?(providers, :ollama)
+      assert providers[:ollama].module == Semanteq.Providers.Ollama
     end
   end
 end

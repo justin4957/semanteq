@@ -16,6 +16,14 @@ config :semanteq, :openai,
   max_tokens: 4096,
   temperature: 0.7
 
+# Ollama local LLM configuration
+config :semanteq, :ollama,
+  base_url: System.get_env("OLLAMA_BASE_URL") || "http://localhost:11434",
+  model: System.get_env("OLLAMA_MODEL") || "llama3.2",
+  timeout_ms: 120_000,
+  num_ctx: 4096,
+  temperature: 0.7
+
 # Provider configuration (default active provider)
 config :semanteq, :provider, active: :anthropic
 

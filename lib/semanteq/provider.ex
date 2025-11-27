@@ -45,6 +45,8 @@ defmodule Semanteq.Provider do
   ## Available Providers
 
   - `:anthropic` - Anthropic Claude API (default)
+  - `:openai` - OpenAI GPT API
+  - `:ollama` - Local LLM via Ollama
   - `:mock` - Mock provider for testing
   """
 
@@ -128,6 +130,7 @@ defmodule Semanteq.Provider do
     %{
       anthropic: Semanteq.Providers.Anthropic,
       openai: Semanteq.Providers.OpenAI,
+      ollama: Semanteq.Providers.Ollama,
       mock: Semanteq.Providers.Mock
     }
   end
