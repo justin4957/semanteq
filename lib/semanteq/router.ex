@@ -89,13 +89,48 @@ defmodule Semanteq.Router do
   ### GET /batch-config
   Get default batch configuration.
 
+  ### POST /property-test
+  Test a G-expression against a mathematical property.
+
+  Request body:
+  ```json
+  {
+    "gexpr": {...},
+    "property": {"type": "commutativity"},
+    "iterations": 100,
+    "min_value": -1000,
+    "max_value": 1000
+  }
+  ```
+
+  ### POST /property-tests
+  Test a G-expression against multiple properties.
+
+  Request body:
+  ```json
+  {
+    "gexpr": {...},
+    "properties": [
+      {"type": "commutativity"},
+      {"type": "associativity"}
+    ],
+    "iterations": 50
+  }
+  ```
+
+  ### GET /property-config
+  Get default property testing configuration.
+
+  ### GET /properties
+  Get list of available property types.
+
   ### GET /health
   Health check endpoint.
   """
 
   use Plug.Router
 
-  alias Semanteq.{Generator, Glisp, Anthropic}
+  alias Semanteq.{Generator, Glisp, Anthropic, PropertyTester}
 
   plug(Plug.Logger)
 
@@ -309,6 +344,88 @@ defmodule Semanteq.Router do
     })
   end
 
+  # POST /property-test - Test a G-expression against a property
+  post "/property-test" do
+    case conn.body_params do
+      %{"gexpr" => gexpr, "property" => property} = params ->
+        opts = parse_property_options(params)
+        parsed_property = parse_property(property)
+
+        case PropertyTester.test_property(gexpr, parsed_property, opts) do
+          {:ok, result} ->
+            send_json(conn, 200, %{success: true, data: result})
+
+          {:error, reason} ->
+            send_json(conn, 422, %{success: false, error: format_error(reason)})
+        end
+
+      %{"gexpr" => _gexpr} ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: property"})
+
+      _ ->
+        send_json(conn, 400, %{success: false, error: "Missing required fields: gexpr, property"})
+    end
+  end
+
+  # POST /property-tests - Test a G-expression against multiple properties
+  post "/property-tests" do
+    case conn.body_params do
+      %{"gexpr" => gexpr, "properties" => properties} = params when is_list(properties) ->
+        opts = parse_property_options(params)
+        parsed_properties = Enum.map(properties, &parse_property/1)
+
+        case PropertyTester.test_properties(gexpr, parsed_properties, opts) do
+          {:ok, result} ->
+            send_json(conn, 200, %{success: true, data: result})
+
+          {:error, reason} ->
+            send_json(conn, 422, %{success: false, error: format_error(reason)})
+        end
+
+      %{"gexpr" => _gexpr, "properties" => _} ->
+        send_json(conn, 400, %{success: false, error: "Field 'properties' must be an array"})
+
+      %{"gexpr" => _gexpr} ->
+        send_json(conn, 400, %{success: false, error: "Missing required field: properties"})
+
+      _ ->
+        send_json(conn, 400, %{
+          success: false,
+          error: "Missing required fields: gexpr, properties"
+        })
+    end
+  end
+
+  # GET /property-config - Get default property testing configuration
+  get "/property-config" do
+    config = PropertyTester.default_config()
+
+    send_json(conn, 200, %{
+      success: true,
+      data: config
+    })
+  end
+
+  # GET /properties - Get list of available property types
+  get "/properties" do
+    properties = PropertyTester.available_properties()
+
+    formatted_properties =
+      Enum.map(properties, fn {type, schema} ->
+        %{
+          type: type,
+          description: schema.description,
+          required_params: schema.required_params,
+          arity: schema.arity
+        }
+      end)
+
+    send_json(conn, 200, %{
+      success: true,
+      data: formatted_properties
+    })
+  end
+
   # GET /health - Health check endpoint
   get "/health" do
     glisp_status = check_glisp_health()
@@ -434,6 +551,81 @@ defmodule Semanteq.Router do
       opts
     end
   end
+
+  defp parse_property_options(params) do
+    opts = %{}
+
+    opts =
+      if Map.has_key?(params, "iterations") do
+        Map.put(opts, :iterations, params["iterations"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "min_value") do
+        Map.put(opts, :min_value, params["min_value"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "max_value") do
+        Map.put(opts, :max_value, params["max_value"])
+      else
+        opts
+      end
+
+    opts =
+      if Map.has_key?(params, "seed") do
+        Map.put(opts, :seed, params["seed"])
+      else
+        opts
+      end
+
+    if Map.has_key?(params, "value_type") do
+      value_type = String.to_existing_atom(params["value_type"])
+      Map.put(opts, :value_type, value_type)
+    else
+      opts
+    end
+  end
+
+  defp parse_property(property) when is_map(property) do
+    # Convert string keys to atoms for known property fields
+    type =
+      case Map.get(property, "type") || Map.get(property, :type) do
+        nil -> nil
+        type when is_binary(type) -> String.to_existing_atom(type)
+        type when is_atom(type) -> type
+      end
+
+    base = %{type: type}
+
+    # Parse optional parameters based on property type
+    base
+    |> maybe_add_param(property, "identity_element", :identity_element)
+    |> maybe_add_param(property, "inverse_fn", :inverse_fn, &parse_inverse_fn/1)
+    |> maybe_add_param(property, "outer_fn", :outer_fn)
+    |> maybe_add_param(property, "min_bound", :min_bound)
+    |> maybe_add_param(property, "max_bound", :max_bound)
+    |> maybe_add_param(property, "description", :description)
+  end
+
+  defp maybe_add_param(map, source, string_key, atom_key, transformer \\ &Function.identity/1) do
+    value = Map.get(source, string_key) || Map.get(source, atom_key)
+
+    if value do
+      Map.put(map, atom_key, transformer.(value))
+    else
+      map
+    end
+  end
+
+  defp parse_inverse_fn("negate"), do: :negate
+  defp parse_inverse_fn("reciprocal"), do: :reciprocal
+  defp parse_inverse_fn(fn_name) when is_binary(fn_name), do: String.to_existing_atom(fn_name)
+  defp parse_inverse_fn(fn_atom) when is_atom(fn_atom), do: fn_atom
 
   defp format_error(%{step: step, reason: reason}) do
     "Failed at #{step}: #{inspect(reason)}"
