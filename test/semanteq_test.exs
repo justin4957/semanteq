@@ -1,7 +1,7 @@
 defmodule SemanteqTest do
   use ExUnit.Case
 
-  alias Semanteq.{Glisp, Anthropic, Generator, Router, PropertyTester}
+  alias Semanteq.{Glisp, Anthropic, Generator, Router, PropertyTester, Tracer}
 
   describe "Semanteq.Glisp" do
     test "project_dir returns configured path" do
@@ -103,6 +103,65 @@ defmodule SemanteqTest do
       property = %{type: :identity}
       {:error, reason} = PropertyTester.test_property(gexpr, property)
       assert reason =~ "Missing required parameters"
+    end
+  end
+
+  describe "Semanteq.Tracer" do
+    test "trace_levels returns available levels" do
+      levels = Tracer.trace_levels()
+      assert is_map(levels)
+      assert Map.has_key?(levels, :minimal)
+      assert Map.has_key?(levels, :standard)
+      assert Map.has_key?(levels, :verbose)
+    end
+
+    test "default_config returns expected defaults" do
+      config = Tracer.default_config()
+      assert config.level == :standard
+      assert config.include_source == true
+      assert config.include_timestamps == true
+      assert config.max_depth == 100
+    end
+
+    test "compare_traces returns comparison result" do
+      trace_a = %{level: :standard, status: :success, steps: [], duration_ms: 10}
+      trace_b = %{level: :standard, status: :success, steps: [], duration_ms: 15}
+
+      {:ok, result} = Tracer.compare_traces(trace_a, trace_b)
+      assert Map.has_key?(result, :equivalent)
+      assert Map.has_key?(result, :differences)
+      assert Map.has_key?(result, :summary)
+    end
+
+    test "compare_traces detects level mismatch" do
+      trace_a = %{level: :minimal, status: :success, steps: []}
+      trace_b = %{level: :verbose, status: :success, steps: []}
+
+      {:ok, result} = Tracer.compare_traces(trace_a, trace_b)
+      assert result.equivalent == false
+      assert Enum.any?(result.differences, &(&1.type == :level_mismatch))
+    end
+
+    test "analyze_trace returns analysis" do
+      trace = %{
+        level: :standard,
+        status: :success,
+        steps: [%{type: :eval, depth: 0}, %{type: :app, depth: 1}],
+        step_count: 2,
+        duration_ms: 50
+      }
+
+      {:ok, analysis} = Tracer.analyze_trace(trace)
+      assert analysis.total_steps == 2
+      assert is_map(analysis.step_type_distribution)
+      assert analysis.duration_ms == 50
+    end
+
+    test "format_trace returns JSON string" do
+      trace = %{level: :standard, status: :success}
+      json = Tracer.format_trace(trace, %{format: :json})
+      assert is_binary(json)
+      {:ok, _} = Jason.decode(json)
     end
   end
 
@@ -392,6 +451,131 @@ defmodule SemanteqTest do
       types = Enum.map(body["data"], & &1["type"])
       assert "commutativity" in types
       assert "associativity" in types
+    end
+
+    test "POST /trace without gexpr returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/trace", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "gexpr"
+    end
+
+    test "POST /trace/compare without trace_a returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/trace/compare",
+          Jason.encode!(%{"trace_b" => %{"level" => "standard"}})
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "trace_a"
+    end
+
+    test "POST /trace/compare without trace_b returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/trace/compare",
+          Jason.encode!(%{"trace_a" => %{"level" => "standard"}})
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "trace_b"
+    end
+
+    test "POST /trace/compare with both traces returns 200" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/trace/compare",
+          Jason.encode!(%{
+            "trace_a" => %{"level" => "standard", "steps" => []},
+            "trace_b" => %{"level" => "standard", "steps" => []}
+          })
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert Map.has_key?(body["data"], "equivalent")
+    end
+
+    test "POST /trace/analyze without trace returns 400" do
+      conn =
+        :post
+        |> Plug.Test.conn("/trace/analyze", Jason.encode!(%{}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 400
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == false
+      assert body["error"] =~ "trace"
+    end
+
+    test "POST /trace/analyze with trace returns 200" do
+      conn =
+        :post
+        |> Plug.Test.conn(
+          "/trace/analyze",
+          Jason.encode!(%{
+            "trace" => %{"level" => "standard", "steps" => [], "duration_ms" => 10}
+          })
+        )
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert Map.has_key?(body["data"], "total_steps")
+    end
+
+    test "GET /trace-config returns default configuration" do
+      conn = Plug.Test.conn(:get, "/trace-config")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert body["data"]["level"] == "standard"
+      assert body["data"]["include_source"] == true
+      assert body["data"]["max_depth"] == 100
+    end
+
+    test "GET /trace-levels returns available levels" do
+      conn = Plug.Test.conn(:get, "/trace-levels")
+      conn = Router.call(conn, Router.init([]))
+
+      assert conn.status == 200
+      {:ok, body} = Jason.decode(conn.resp_body)
+      assert body["success"] == true
+      assert Map.has_key?(body["data"], "minimal")
+      assert Map.has_key?(body["data"], "standard")
+      assert Map.has_key?(body["data"], "verbose")
     end
 
     test "unknown route returns 404" do
